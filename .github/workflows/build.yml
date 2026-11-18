@@ -13,27 +13,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create complete Android project with C++ Bridge
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK and NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.1.8937393" "cmake;3.22.1"
+
+      - name: Create project files
         run: |
           mkdir -p app/src/main/java/com/seuapp/emuladorps2
           mkdir -p app/src/main/res/layout
-          mkdir -p app/src/main/jniLibs/arm64-v8a
           mkdir -p app/src/main/cpp
+          mkdir -p app/src/main/jniLibs/arm64-v8a
 
           cat << 'EOF' > settings.gradle
           pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
+              repositories { google(); mavenCentral() }
           }
           rootProject.name = "EmuladorPS2"
           include ':app'
@@ -61,17 +65,19 @@ jobs:
           android {
               namespace 'com.seuapp.emuladorps2'
               compileSdk 34
+              ndkVersion "25.1.8937393"
               defaultConfig {
                   applicationId "com.seuapp.emuladorps2"
                   minSdk 26
                   targetSdk 34
-                  versionCode 2
-                  versionName "2.1"
+                  versionCode 1
+                  versionName "2.0"
                   ndk { abiFilters += ['arm64-v8a'] }
               }
               externalNativeBuild {
                   cmake {
                       path "src/main/cpp/CMakeLists.txt"
+                      version "3.22.1"
                   }
               }
               compileOptions {
@@ -88,18 +94,128 @@ jobs:
           }
           EOF
 
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("ps2bridge")
+          add_library(ps2bridge SHARED libretro_bridge.cpp)
+          find_library(log-lib log)
+          find_library(android-lib android)
+          target_link_libraries(ps2bridge ${log-lib} ${android-lib} dl)
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/libretro_bridge.cpp
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <cstring>
+          #include <string>
+          #include <android/native_window.h>
+          #include <android/native_window_jni.h>
+          #include <android/log.h>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PS2Bridge", __VA_ARGS__)
+
+          struct retro_game_info { const char *path; const void *data; size_t size; const char *meta; };
+          typedef void (*retro_init_t)(void);
+          typedef void (*retro_deinit_t)(void);
+          typedef bool (*retro_load_game_t)(const struct retro_game_info*);
+          typedef void (*retro_run_t)(void);
+          typedef void (*retro_set_environment_t)(bool (*)(unsigned, void*));
+          typedef void (*retro_set_video_refresh_t)(void (*)(const void*, unsigned, unsigned, size_t));
+          typedef void (*retro_set_audio_sample_t)(void (*)(int16_t, int16_t));
+          typedef void (*retro_set_audio_sample_batch_t)(size_t (*)(const int16_t*, size_t));
+          typedef void (*retro_set_input_poll_t)(void (*)(void));
+          typedef void (*retro_set_input_state_t)(int16_t (*)(unsigned, unsigned, unsigned, unsigned));
+
+          static void* core = nullptr;
+          static ANativeWindow* win = nullptr;
+          static std::string sys_dir;
+          static std::string rom_file;
+          static volatile bool running = false;
+          static int16_t pad_state[16] = {0};
+
+          static bool env_cb(unsigned cmd, void* data) {
+              if (cmd == 10 || cmd == 31) { *(const char**)data = sys_dir.c_str(); return true; }
+              return false;
+          }
+
+          static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
+              if (!data || !win) return;
+              ANativeWindow_setBuffersGeometry(win, w, h, WINDOW_FORMAT_RGBX_8888);
+              ANativeWindow_Buffer buf;
+              if (ANativeWindow_lock(win, &buf, nullptr) == 0) {
+                  const uint8_t* src = (const uint8_t*)data;
+                  uint8_t* dst = (uint8_t*)buf.bits;
+                  for (unsigned y = 0; y < h; y++) {
+                      memcpy(dst + y * buf.stride * 4, src + y * pitch, w * 4);
+                  }
+                  ANativeWindow_unlockAndPost(win);
+              }
+          }
+
+          static void audio_cb(int16_t l, int16_t r) {}
+          static size_t audio_batch_cb(const int16_t* data, size_t frames) { return frames; }
+          static void input_poll_cb(void) {}
+          static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id) {
+              if (port == 0 && id < 16) return pad_state[id];
+              return 0;
+          }
+
+          static void* emu_thread(void*) {
+              auto p_init = (retro_init_t)dlsym(core, "retro_init");
+              auto p_load = (retro_load_game_t)dlsym(core, "retro_load_game");
+              auto p_run = (retro_run_t)dlsym(core, "retro_run");
+              if (p_init) p_init();
+              retro_game_info info = { rom_file.c_str(), nullptr, 0, nullptr };
+              if (p_load && p_load(&info)) {
+                  LOGI("ROM carregada com sucesso!");
+                  while (running && p_run) {
+                      p_run();
+                      usleep(16000);
+                  }
+              }
+              return nullptr;
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_seuapp_emuladorps2_MainActivity_startCore(JNIEnv* env, jobject, jstring jsys, jstring jrom, jobject surface) {
+              const char* s = env->GetStringUTFChars(jsys, nullptr);
+              const char* r = env->GetStringUTFChars(jrom, nullptr);
+              sys_dir = s; rom_file = r;
+              env->ReleaseStringUTFChars(jsys, s);
+              env->ReleaseStringUTFChars(jrom, r);
+
+              if (win) ANativeWindow_release(win);
+              win = ANativeWindow_fromSurface(env, surface);
+
+              core = dlopen("libplay_libretro_android.so", RTLD_LAZY);
+              if (!core) return;
+
+              ((retro_set_environment_t)dlsym(core, "retro_set_environment"))(env_cb);
+              ((retro_set_video_refresh_t)dlsym(core, "retro_set_video_refresh"))(video_cb);
+              ((retro_set_audio_sample_t)dlsym(core, "retro_set_audio_sample"))(audio_cb);
+              ((retro_set_audio_sample_batch_t)dlsym(core, "retro_set_audio_sample_batch"))(audio_batch_cb);
+              ((retro_set_input_poll_t)dlsym(core, "retro_set_input_poll"))(input_poll_cb);
+              ((retro_set_input_state_t)dlsym(core, "retro_set_input_state"))(input_state_cb);
+
+              running = true;
+              pthread_t th;
+              pthread_create(&th, nullptr, emu_thread, nullptr);
+              pthread_detach(th);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_seuapp_emuladorps2_MainActivity_setButton(JNIEnv*, jobject, jint id, jboolean pressed) {
+              if (id >= 0 && id < 16) pad_state[id] = pressed ? 1 : 0;
+          }
+          EOF
+
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application
-                  android:allowBackup="true"
-                  android:largeHeap="true"
-                  android:label="Emulador PS2"
-                  android:theme="@style/Theme.AppCompat.NoActionBar">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:screenOrientation="landscape">
+              <application android:allowBackup="true" android:label="Emulador PS2" android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="landscape">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -111,48 +227,14 @@ jobs:
 
           cat << 'EOF' > app/src/main/res/layout/activity_main.xml
           <?xml version="1.0" encoding="utf-8"?>
-          <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent"
-              android:layout_height="match_parent"
-              android:background="#000000">
-              <SurfaceView
-                  android:id="@+id/gameSurface"
-                  android:layout_width="match_parent"
-                  android:layout_height="match_parent" />
-              <LinearLayout
-                  android:id="@+id/menuLayout"
-                  android:layout_width="match_parent"
-                  android:layout_height="wrap_content"
-                  android:layout_centerInParent="true"
-                  android:layout_margin="32dp"
-                  android:background="#E61E1E1E"
-                  android:orientation="vertical"
-                  android:padding="20dp">
-                  <Button
-                      android:id="@+id/btnSelectBios"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:text="1. Selecionar BIOS (.bin)" />
-                  <Button
-                      android:id="@+id/btnSelectRom"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="8dp"
-                      android:text="2. Selecionar Jogo/ROM (.iso / .chd)" />
-                  <Button
-                      android:id="@+id/btnPlay"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:backgroundTint="#2E7D32"
-                      android:text="3. Jogar" />
+          <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:background="#121212">
+              <SurfaceView android:id="@+id/gameSurface" android:layout_width="match_parent" android:layout_height="match_parent" />
+              <LinearLayout android:id="@+id/menuLayout" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_centerInParent="true" android:layout_margin="32dp" android:background="#E61E1E1E" android:orientation="vertical" android:padding="20dp">
+                  <Button android:id="@+id/btnSelectBios" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="1. Selecionar BIOS (.bin)" />
+                  <Button android:id="@+id/btnSelectRom" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="2. Selecionar Jogo/ROM (.iso / .chd)" />
+                  <Button android:id="@+id/btnPlay" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:backgroundTint="#2E7D32" android:text="3. Jogar" />
               </LinearLayout>
-              <RelativeLayout
-                  android:id="@+id/controlsOverlay"
-                  android:layout_width="match_parent"
-                  android:layout_height="match_parent"
-                  android:padding="12dp"
-                  android:visibility="gone">
+              <RelativeLayout android:id="@+id/controlsOverlay" android:layout_width="match_parent" android:layout_height="match_parent" android:padding="12dp" android:visibility="gone">
                   <Button android:id="@+id/btnL2" android:layout_width="64dp" android:layout_height="44dp" android:layout_alignParentStart="true" android:layout_alignParentTop="true" android:alpha="0.7" android:text="L2" />
                   <Button android:id="@+id/btnL1" android:layout_width="64dp" android:layout_height="44dp" android:layout_below="@id/btnL2" android:layout_alignParentStart="true" android:alpha="0.7" android:text="L1" />
                   <Button android:id="@+id/btnR2" android:layout_width="64dp" android:layout_height="44dp" android:layout_alignParentTop="true" android:layout_alignParentEnd="true" android:alpha="0.7" android:text="R2" />
@@ -171,145 +253,6 @@ jobs:
                   <Button android:id="@+id/btnCircle" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentEnd="true" android:layout_alignParentBottom="true" android:layout_marginEnd="6dp" android:layout_marginBottom="60dp" android:alpha="0.7" android:text="○" />
               </RelativeLayout>
           </RelativeLayout>
-          EOF
-
-          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
-          cmake_minimum_required(VERSION 3.22.1)
-          project("ps2bridge")
-          add_library(ps2bridge SHARED ps2bridge.cpp)
-          find_library(log-lib log)
-          find_library(android-lib android)
-          target_link_libraries(ps2bridge ${log-lib} ${android-lib} dl)
-          EOF
-
-          cat << 'EOF' > app/src/main/cpp/ps2bridge.cpp
-          #include <jni.h>
-          #include <dlfcn.h>
-          #include <android/native_window_jni.h>
-          #include <android/log.h>
-          #include <thread>
-          #include <atomic>
-          #include <cstring>
-          #include <string>
-
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PS2Bridge", __VA_ARGS__)
-          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PS2Bridge", __VA_ARGS__)
-
-          struct retro_game_info {
-              const char *path;
-              const void *data;
-              size_t      size;
-              const char *meta;
-          };
-
-          typedef void (*retro_init_t)(void);
-          typedef void (*retro_deinit_t)(void);
-          typedef bool (*retro_load_game_t)(const struct retro_game_info *game);
-          typedef void (*retro_run_t)(void);
-          typedef void (*retro_set_environment_t)(bool (*cb)(unsigned cmd, void *data));
-          typedef void (*retro_set_video_refresh_t)(void (*cb)(const void *data, unsigned width, unsigned height, size_t pitch));
-          typedef void (*retro_set_audio_sample_t)(void (*cb)(int16_t left, int16_t right));
-          typedef void (*retro_set_audio_sample_batch_t)(size_t (*cb)(const int16_t *data, size_t frames));
-          typedef void (*retro_set_input_poll_t)(void (*cb)(void));
-          typedef void (*retro_set_input_state_t)(int16_t (*cb)(unsigned port, unsigned device, unsigned index, unsigned id));
-
-          static void* core_handle = nullptr;
-          static ANativeWindow* native_window = nullptr;
-          static std::atomic<bool> is_running{false};
-          static std::string sys_dir;
-          static int16_t button_states = {0};
-
-          static bool env_cb(unsigned cmd, void *data) {
-              if (cmd == 10 || cmd == 31) {
-                  *(const char**)data = sys_dir.c_str();
-                  return true;
-              }
-              if (cmd == 10) {
-                  *(enum retro_pixel_format*)data = 1;
-                  return true;
-              }
-              return false;
-          }
-
-          static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
-              if (!data || !native_window) return;
-              ANativeWindow_setBuffersGeometry(native_window, width, height, WINDOW_FORMAT_RGBA_8888);
-              ANativeWindow_Buffer buffer;
-              if (ANativeWindow_lock(native_window, &buffer, nullptr) == 0) {
-                  uint8_t* dst = (uint8_t*)buffer.bits;
-                  const uint8_t* src = (const uint8_t*)data;
-                  for (unsigned y = 0; y < height; y++) {
-                      memcpy(dst + y * buffer.stride * 4, src + y * pitch, width * 4);
-                  }
-                  ANativeWindow_unlockAndPost(native_window);
-              }
-          }
-
-          static void audio_sample_cb(int16_t left, int16_t right) {}
-          static size_t audio_batch_cb(const int16_t *data, size_t frames) { return frames; }
-          static void input_poll_cb(void) {}
-          static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id) {
-              if (port == 0 && id < 16) return button_states[id];
-              return 0;
-          }
-
-          extern "C" JNIEXPORT void JNICALL
-          Java_com_seuapp_emuladorps2_MainActivity_setButtonState(JNIEnv*, jobject, jint id, jboolean pressed) {
-              if (id >= 0 && id < 16) button_states[id] = pressed ? 1 : 0;
-          }
-
-          extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_seuapp_emuladorps2_MainActivity_startCore(JNIEnv* env, jobject, jstring jSystemDir, jstring jRomPath, jobject surface) {
-              if (is_running) return JNI_TRUE;
-              const char* sDir = env->GetStringUTFChars(jSystemDir, nullptr);
-              const char* rPath = env->GetStringUTFChars(jRomPath, nullptr);
-              sys_dir = sDir;
-              std::string rom_path = rPath;
-              env->ReleaseStringUTFChars(jSystemDir, sDir);
-              env->ReleaseStringUTFChars(jRomPath, rPath);
-
-              if (native_window) ANativeWindow_release(native_window);
-              native_window = ANativeWindow_fromSurface(env, surface);
-
-              core_handle = dlopen("libplay_libretro_android.so", RTLD_LAZY);
-              if (!core_handle) {
-                  LOGE("Falha ao abrir libplay_libretro_android.so: %s", dlerror());
-                  return JNI_FALSE;
-              }
-
-              auto retro_set_environment = (retro_set_environment_t)dlsym(core_handle, "retro_set_environment");
-              auto retro_set_video_refresh = (retro_set_video_refresh_t)dlsym(core_handle, "retro_set_video_refresh");
-              auto retro_set_audio_sample = (retro_set_audio_sample_t)dlsym(core_handle, "retro_set_audio_sample");
-              auto retro_set_audio_sample_batch = (retro_set_audio_sample_batch_t)dlsym(core_handle, "retro_set_audio_sample_batch");
-              auto retro_set_input_poll = (retro_set_input_poll_t)dlsym(core_handle, "retro_set_input_poll");
-              auto retro_set_input_state = (retro_set_input_state_t)dlsym(core_handle, "retro_set_input_state");
-              auto retro_init = (retro_init_t)dlsym(core_handle, "retro_init");
-              auto retro_load_game = (retro_load_game_t)dlsym(core_handle, "retro_load_game");
-              auto retro_run = (retro_run_t)dlsym(core_handle, "retro_run");
-
-              retro_set_environment(env_cb);
-              retro_set_video_refresh(video_cb);
-              retro_set_audio_sample(audio_sample_cb);
-              retro_set_audio_sample_batch(audio_batch_cb);
-              retro_set_input_poll(input_poll_cb);
-              retro_set_input_state(input_state_cb);
-              retro_init();
-
-              struct retro_game_info info = { rom_path.c_str(), nullptr, 0, nullptr };
-              if (!retro_load_game(&info)) {
-                  LOGE("Falha ao carregar ROM: %s", rom_path.c_str());
-                  return JNI_FALSE;
-              }
-
-              is_running = true;
-              std::thread([retro_run]() {
-                  while (is_running) {
-                      retro_run();
-                  }
-              }).detach();
-
-              return JNI_TRUE;
-          }
           EOF
 
           cat << 'EOF' > app/src/main/java/com/seuapp/emuladorps2/MainActivity.kt
@@ -347,38 +290,65 @@ jobs:
                   val menuLayout = findViewById<LinearLayout>(R.id.menuLayout)
                   val controlsOverlay = findViewById<RelativeLayout>(R.id.controlsOverlay)
                   val gameSurface = findViewById<SurfaceView>(R.id.gameSurface)
-                  val btnPlay = findViewById<Button>(R.id.btnPlay)
 
                   findViewById<Button>(R.id.btnSelectBios).setOnClickListener { selectBiosLauncher.launch(arrayOf("*/*")) }
                   findViewById<Button>(R.id.btnSelectRom).setOnClickListener { selectRomLauncher.launch(arrayOf("*/*")) }
-
-                  btnPlay.setOnClickListener {
+                  findViewById<Button>(R.id.btnPlay).setOnClickListener {
                       if (romUri == null) {
-                          Toast.makeText(this, "Selecione o arquivo .iso do jogo primeiro!", Toast.LENGTH_SHORT).show()
+                          Toast.makeText(this, "Selecione o jogo (.iso) primeiro!", Toast.LENGTH_SHORT).show()
                           return@setOnClickListener
                       }
-                      btnPlay.isEnabled = false
-                      btnPlay.text = "Preparando jogo (aguarde)..."
+                      menuLayout.visibility = View.GONE
+                      controlsOverlay.visibility = View.VISIBLE
+                      Toast.makeText(this, "Preparando jogo, aguarde...", Toast.LENGTH_SHORT).show()
 
                       Thread {
-                          try {
-                              val sysDir = File(filesDir, "system").apply { mkdirs() }
-                              biosUri?.let { uri ->
-                                  contentResolver.openInputStream(uri)?.use { input ->
-                                      File(sysDir, "ps2_bios.bin").outputStream().use { output -> input.copyTo(output) }
-                                  }
+                          val sysDir = File(filesDir, "system").apply { mkdirs() }
+                          biosUri?.let { uri ->
+                              contentResolver.openInputStream(uri)?.use { input ->
+                                  File(sysDir, "scph10000.bin").outputStream().use { input.copyTo(it) }
                               }
-                              val romFile = File(cacheDir, "game.iso")
-                              contentResolver.openInputStream(romUri!!)?.use { input ->
-                                  romFile.outputStream().use { output -> input.copyTo(output) }
-                              }
+                          }
+                          val romFile = File(cacheDir, "game.iso")
+                          contentResolver.openInputStream(romUri!!)?.use { input ->
+                              romFile.outputStream().use { input.copyTo(it) }
+                          }
+                          runOnUiThread {
+                              startCore(sysDir.absolutePath, romFile.absolutePath, gameSurface.holder.surface)
+                          }
+                      }.start()
+                  }
 
-                              runOnUiThread {
-                                  val ok = startCore(sysDir.absolutePath, romFile.absolutePath,
+                  val map = mapOf(
+                      R.id.btnCross to 0, R.id.btnSquare to 1, R.id.btnSelect to 2, R.id.btnStart to 3,
+                      R.id.btnDpadUp to 4, R.id.btnDpadRight to 5, R.id.btnDpadDown to 6, R.id.btnDpadLeft to 7,
+                      R.id.btnL2 to 8, R.id.btnR2 to 9, R.id.btnL1 to 10, R.id.btnR1 to 11,
+                      R.id.btnTriangle to 12, R.id.btnCircle to 13
+                  )
+                  map.forEach { (id, code) ->
+                      findViewById<Button>(id).setOnTouchListener { _, event ->
+                          if (event.action == MotionEvent.ACTION_DOWN) setButton(code, true)
+                          else if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) setButton(code, false)
+                          true
+                      }
+                  }
+              }
 
-   - name: Upload APK
-     uses: actions/upload-artifact@v4
-     with:
-       name: app-debug
-       path: app/build/outputs/apk/debug/app-debug.apk
-       
+              private external fun startCore(sysDir: String, romPath: String, surface: Surface)
+              private external fun setButton(id: Int, pressed: Boolean)
+
+              companion object {
+                  init { System.loadLibrary("ps2bridge") }
+              }
+          }
+          EOF
+
+      - name: Download PS2 core
+        run: |
+          curl -fL "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/play_libretro_android.so.zip" -o core.zip
+          unzip -o core.zip -d app/src/main/jniLibs/arm64-v8a/
+          mv app/src/main/jniLibs/arm64-v8a/play_libretro_android.so app/src/main/jniLibs/arm64-v8a/libplay_libretro_android.so
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        wi
