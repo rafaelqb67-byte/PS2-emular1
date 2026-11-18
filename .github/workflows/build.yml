@@ -13,13 +13,224 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract project ZIP
-        run: unzip -o "*.zip"
+      - name: Create complete Android project
+        run: |
+          mkdir -p app/src/main/java/com/seuapp/emuladorps2
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "EmuladorPS2"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.seuapp.emuladorps2'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.seuapp.emuladorps2"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "2.0"
+                  ndk { abiFilters += ['arm64-v8a'] }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.activity:activity-ktx:1.8.2'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:label="Emulador PS2"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#121212">
+              <SurfaceView
+                  android:id="@+id/gameSurface"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent" />
+              <LinearLayout
+                  android:id="@+id/menuLayout"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_centerInParent="true"
+                  android:layout_margin="32dp"
+                  android:background="#E61E1E1E"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+                  <Button
+                      android:id="@+id/btnSelectBios"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="1. Selecionar BIOS (.bin)" />
+                  <Button
+                      android:id="@+id/btnSelectRom"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="2. Selecionar Jogo/ROM (.iso / .chd)" />
+                  <Button
+                      android:id="@+id/btnPlay"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:backgroundTint="#2E7D32"
+                      android:text="3. Jogar" />
+              </LinearLayout>
+              <RelativeLayout
+                  android:id="@+id/controlsOverlay"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:padding="12dp"
+                  android:visibility="gone">
+                  <Button android:id="@+id/btnL2" android:layout_width="64dp" android:layout_height="44dp" android:layout_alignParentStart="true" android:layout_alignParentTop="true" android:alpha="0.7" android:text="L2" />
+                  <Button android:id="@+id/btnL1" android:layout_width="64dp" android:layout_height="44dp" android:layout_below="@id/btnL2" android:layout_alignParentStart="true" android:alpha="0.7" android:text="L1" />
+                  <Button android:id="@+id/btnR2" android:layout_width="64dp" android:layout_height="44dp" android:layout_alignParentTop="true" android:layout_alignParentEnd="true" android:alpha="0.7" android:text="R2" />
+                  <Button android:id="@+id/btnR1" android:layout_width="64dp" android:layout_height="44dp" android:layout_below="@id/btnR2" android:layout_alignParentEnd="true" android:alpha="0.7" android:text="R1" />
+                  <Button android:id="@+id/btnDpadUp" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentStart="true" android:layout_alignParentBottom="true" android:layout_marginStart="58dp" android:layout_marginBottom="112dp" android:alpha="0.7" android:text="↑" />
+                  <Button android:id="@+id/btnDpadDown" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentStart="true" android:layout_alignParentBottom="true" android:layout_marginStart="58dp" android:layout_marginBottom="8dp" android:alpha="0.7" android:text="↓" />
+                  <Button android:id="@+id/btnDpadLeft" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentStart="true" android:layout_alignParentBottom="true" android:layout_marginStart="6dp" android:layout_marginBottom="60dp" android:alpha="0.7" android:text="←" />
+                  <Button android:id="@+id/btnDpadRight" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentStart="true" android:layout_alignParentBottom="true" android:layout_marginStart="110dp" android:layout_marginBottom="60dp" android:alpha="0.7" android:text="→" />
+                  <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_alignParentBottom="true" android:layout_centerHorizontal="true" android:layout_marginBottom="12dp" android:orientation="horizontal">
+                      <Button android:id="@+id/btnSelect" android:layout_width="76dp" android:layout_height="40dp" android:layout_marginEnd="12dp" android:alpha="0.7" android:text="SELECT" android:textSize="11sp" />
+                      <Button android:id="@+id/btnStart" android:layout_width="76dp" android:layout_height="40dp" android:alpha="0.7" android:text="START" android:textSize="11sp" />
+                  </LinearLayout>
+                  <Button android:id="@+id/btnTriangle" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentEnd="true" android:layout_alignParentBottom="true" android:layout_marginEnd="58dp" android:layout_marginBottom="112dp" android:alpha="0.7" android:text="△" />
+                  <Button android:id="@+id/btnCross" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentEnd="true" android:layout_alignParentBottom="true" android:layout_marginEnd="58dp" android:layout_marginBottom="8dp" android:alpha="0.7" android:text="✕" />
+                  <Button android:id="@+id/btnSquare" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentEnd="true" android:layout_alignParentBottom="true" android:layout_marginEnd="110dp" android:layout_marginBottom="60dp" android:alpha="0.7" android:text="□" />
+                  <Button android:id="@+id/btnCircle" android:layout_width="54dp" android:layout_height="54dp" android:layout_alignParentEnd="true" android:layout_alignParentBottom="true" android:layout_marginEnd="6dp" android:layout_marginBottom="60dp" android:alpha="0.7" android:text="○" />
+              </RelativeLayout>
+          </RelativeLayout>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/seuapp/emuladorps2/MainActivity.kt
+          package com.seuapp.emuladorps2
+
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.RelativeLayout
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+              private var biosUri: Uri? = null
+              private var romUri: Uri? = null
+
+              private val selectBiosLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+                  uri?.let { biosUri = it; Toast.makeText(this, "BIOS selecionada!", Toast.LENGTH_SHORT).show() }
+              }
+              private val selectRomLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+                  uri?.let { romUri = it; Toast.makeText(this, "Jogo selecionado!", Toast.LENGTH_SHORT).show() }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  val menuLayout = findViewById<LinearLayout>(R.id.menuLayout)
+                  val controlsOverlay = findViewById<RelativeLayout>(R.id.controlsOverlay)
+
+                  findViewById<Button>(R.id.btnSelectBios).setOnClickListener { selectBiosLauncher.launch(arrayOf("*/*")) }
+                  findViewById<Button>(R.id.btnSelectRom).setOnClickListener { selectRomLauncher.launch(arrayOf("*/*")) }
+                  findViewById<Button>(R.id.btnPlay).setOnClickListener {
+                      if (biosUri == null || romUri == null) {
+                          Toast.makeText(this, "Selecione a BIOS e a ROM primeiro!", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
+                      menuLayout.visibility = View.GONE
+                      controlsOverlay.visibility = View.VISIBLE
+                      Toast.makeText(this, "Núcleo PS2 carregado!", Toast.LENGTH_SHORT).show()
+                  }
+
+                  val botoes = listOf(R.id.btnDpadUp, R.id.btnDpadDown, R.id.btnDpadLeft, R.id.btnDpadRight,
+                      R.id.btnTriangle, R.id.btnCircle, R.id.btnCross, R.id.btnSquare,
+                      R.id.btnL1, R.id.btnL2, R.id.btnR1, R.id.btnR2, R.id.btnSelect, R.id.btnStart)
+                  botoes.forEach { id ->
+                      findViewById<Button>(id).setOnTouchListener { _, event ->
+                          event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_UP
+                      }
+                  }
+              }
+
+              companion object {
+                  init {
+                      System.loadLibrary("play_libretro_android")
+                  }
+              }
+          }
+          EOF
 
       - name: Download PS2 core
         run: |
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          curl -fL "https://libretro.com" -o core.zip
+          curl -fL "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/play_libretro_android.so.zip" -o core.zip
           unzip -o core.zip -d app/src/main/jniLibs/arm64-v8a/
           mv app/src/main/jniLibs/arm64-v8a/play_libretro_android.so app/src/main/jniLibs/arm64-v8a/libplay_libretro_android.so
 
@@ -35,7 +246,7 @@ jobs:
           gradle-version: '8.4'
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
+        run: gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
